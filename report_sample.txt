@@ -1,0 +1,19 @@
+SQL Injection Discovery Report
+==============================
+
+Target: http://testphp.vulnweb.com
+Scan time: 2026-03-11 19:42:01
+
+Crawl Results
+-------------
+Endpoints discovered: 84
+Endpoints with parameters: 12
+
+Injection Targets
+-----------------
+Unique injection targets: 12
+Injectable parameters found: 2
+
+Injectable parameters:
+ - http://testphp.vulnweb.com/product.php (param: pic)
+ - http://testphp.vulnweb.com/listproducts.php (param: cat)
