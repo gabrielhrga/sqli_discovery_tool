@@ -1,137 +1,263 @@
 import json
 from urllib.parse import urlparse, parse_qs
 import subprocess
-import sys
-import time
+from concurrent.futures import ThreadPoolExecutor
+from playwright.sync_api import sync_playwright
+from urllib.parse import urljoin
 
-# 1) Testing for query parameters
+# -----------------------------
+# TARGET EXTRACTORS
+# -----------------------------
 
-def normalize_katana_entry(katana_entry: dict) -> dict | None:
-    """
-    Normalize a single Katana JSON entry into a minimal sqlmap-ready object.
-    Returns None if no query parameters are found.
-    """
+def extract_query_targets(katana_entry: dict) -> list:
+    targets = []
 
     try:
-        method = katana_entry["request"]["method"]
         endpoint = katana_entry["request"]["endpoint"]
     except KeyError:
-        return None  # malformed entry
+        return targets
 
-    parsed_url = urlparse(endpoint)
+    parsed = urlparse(endpoint)
 
-    if not parsed_url.query:
-        return None
+    if not parsed.query:
+        return targets
 
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    params = parse_qs(parsed.query).keys()
 
-    query_params = parse_qs(parsed_url.query)
-    param_names = list(query_params.keys())
+    for param in params:
+        targets.append({
+            "type": "query",
+            "method": "GET",
+            "url": base_url,
+            "param": param,
+            "data": None
+        })
 
-    normalized = {
-        "method": method,
-        "base_url": base_url,
-        "params": param_names
-    }
+    return targets
 
-    return normalized
 
-def normalize_file(katana_jsonl_path: str, output_path: str) -> None:
-    seen = set()
+def extract_path_targets(katana_entry: dict) -> list:
+    targets = []
 
-    with open(katana_jsonl_path, "r", encoding="utf-8") as infile, \
-         open(output_path, "w", encoding="utf-8") as outfile:
+    try:
+        endpoint = katana_entry["request"]["endpoint"]
+    except KeyError:
+        return targets
 
-        for line in infile:
-            line = line.strip()
-            if not line:
-                continue
+    parsed = urlparse(endpoint)
+    path_segments = parsed.path.strip("/").split("/")
 
-            try:
-                katana_entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    for segment in path_segments:
+        if segment.isdigit():
+            targets.append({
+                "type": "path",
+                "method": "GET",
+                "url": endpoint,
+                "param": segment,
+                "data": None
+            })
 
-            normalized = normalize_katana_entry(katana_entry)
-            if not normalized:
-                continue
+    return targets
 
-            method = normalized["method"]
-            base_url = normalized["base_url"]
 
-            # Discuss singular vs multiple parameters
-            for param in normalized["params"]:
-                dedup_key = (method, base_url, param)
+def extract_form_targets(url: str) -> list:
+    targets = []
 
-                if dedup_key in seen:
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+
+            page.goto(url, timeout=10000)
+
+            forms = page.query_selector_all("form")
+
+            for form in forms:
+                method = form.get_attribute("method")
+                action = form.get_attribute("action")
+
+                method = method.upper() if method else "GET"
+
+                # Resolve action URL
+                if action:
+                    form_url = urljoin(url, action)
+                else:
+                    form_url = url  # fallback
+
+                inputs = form.query_selector_all("input, textarea, select")
+
+                param_names = []
+
+                for inp in inputs:
+                    name = inp.get_attribute("name")
+                    if name:
+                        param_names.append(name)
+
+                # Skip empty forms
+                if not param_names:
                     continue
 
-                seen.add(dedup_key)
+                # Build POST data string
+                data = "&".join([f"{p}=test" for p in param_names])
 
-                output_object = {
-                    "method": method,
-                    "base_url": base_url,
-                    "param": param
-                }
+                # Create ONE target per parameter
+                for param in param_names:
+                    targets.append({
+                        "type": "form",
+                        "method": method,
+                        "url": form_url,
+                        "param": param,
+                        "data": data
+                    })
 
-                outfile.write(json.dumps(output_object) + "\n")
+            browser.close()
+
+    except Exception:
+        return []
+
+    return targets
+
+
+# -----------------------------
+# CORE PIPELINE
+# -----------------------------
+
+def collect_targets(katana_file: str) -> list:
+    targets = []
+    unique_urls = set()
+
+    with open(katana_file, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except:
+                continue
+
+            targets.extend(extract_query_targets(entry))
+            targets.extend(extract_path_targets(entry))
+
+            # Collect base URLs for form extraction
+            try:
+                endpoint = entry["request"]["endpoint"]
+                parsed = urlparse(endpoint)
+                base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                unique_urls.add(base_url)
+            except:
+                pass
+
+    # Form extraction (future Playwright integration)
+    for url in unique_urls:
+        targets.extend(extract_form_targets(url))
+
+    return targets
+
+
+def deduplicate_targets(targets: list) -> list:
+    seen = set()
+    unique = []
+
+    for t in targets:
+        key = (t["type"], t["method"], t["url"], t["param"])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        unique.append(t)
+
+    return unique
+
+
+def save_targets(targets: list, output_file: str):
+    with open(output_file, "w", encoding="utf-8") as f:
+        for t in targets:
+            f.write(json.dumps(t) + "\n")
+
+
+# -----------------------------
+# EXECUTION
+# -----------------------------
 
 def run_katana(target_url: str, output_file: str):
     command = [
         "katana",
         "-u", target_url,
-        "-jc",  #JS crawling
-        "-j",   #jsonl format
-        "-ob",  #omit body
-        "-or",  #omit raw request
-        "-ef", "png,css", #filters by extension
-        "-f", "qurl",
+        "-jc",
+        "-j",
+        "-ob",
+        "-or",
+        "-ef", "png,css",
         "-o", output_file
-        # optional -f qurl for endpoints with query strings
-        # optional -d 3 for crawl depth=3
-        # optional rate limit
     ]
 
     subprocess.run(command, check=True)
 
-def run_sqlmap(target: dict):
-    base_url = target["base_url"]
-    param = target["param"]
-    method = target["method"]
 
-    if method == "GET":
-        url = f"{base_url}?{param}=test"
+def run_sqlmap(target: dict):
+    if target["type"] == "query":
+        url = f"{target['url']}?{target['param']}=test"
         command = [
             "sqlmap",
             "-u", url,
-            "-p", param,
+            "-p", target["param"],
+            "--batch"
+        ]
+
+    elif target["type"] == "path":
+        url = target["url"].replace(target["param"], "1")
+        command = [
+            "sqlmap",
+            "-u", url,
+            "--batch"
+        ]
+
+    elif target["type"] == "form":
+        command = [
+            "sqlmap",
+            "-u", target["url"],
+            "--data", target["data"],
+            "-p", target["param"],
             "--batch"
         ]
 
     else:
-        # Placeholder for POST later
         return
-    
-    subprocess.run(command, check=True)
 
+    subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
 
 def main():
-    target_url = "http://testphp.vulnweb.com/"
+    target_url = "https://pentest-ground.com:4280/vulnerabilities/sqli/"
     katana_out = "katana_output.jsonl"
-    normalized_out = "targets.jsonl"
+    targets_out = "targets.jsonl"
 
     print("[*] Running katana...")
     run_katana(target_url, katana_out)
 
-    print("[*] Normalizing katana output...")
-    normalize_file(katana_out, normalized_out)
+    print("[*] Collecting targets...")
+    targets = collect_targets(katana_out)
 
-    print("[*] Running sqlmap...    ")
-    with open(normalized_out, "r", encoding="utf-8") as f:
-        for line in f:
-            target = json.loads(line)
-            run_sqlmap(target)
-            time.sleep(1)
+    print("[*] Deduplicating targets...")
+    targets = deduplicate_targets(targets)
+
+    print(f"[*] Total targets: {len(targets)}")
+
+    print("[*] Saving targets...")
+    save_targets(targets, targets_out)
+
+    print("[*] Running sqlmap...")
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        executor.map(run_sqlmap, targets)
+
 
 if __name__ == "__main__":
     main()
